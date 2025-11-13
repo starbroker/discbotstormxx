@@ -2,7 +2,6 @@
 FROM python:3.10-slim
 
 # Install ffmpeg
-# This is the crucial step for any audio bot
 RUN apt-get update && apt-get install -y ffmpeg
 
 # Set the working directory in the container
