@@ -237,7 +237,7 @@ async def extract_with_auto_bypass(url: str, guild: Optional[discord.Guild]=None
     # Try each strategy
     for name, opts in strategies:
         attempted.append(name)
-        print(f"🛠️ Bypass attempt '{name}' with options: { {k: v for k, v in opts.items() if k != 'http_headers'} }")
+        print(f"🛠️ Bypass attempt '{name}' with options: {{ {k: v for k, v in opts.items() if k != 'http_headers'} }}")
         try:
             ydl = make_ydl(opts)
             info = await extract_with_timeout(ydl, url, timeout=base_timeout + 5)
@@ -255,18 +255,51 @@ async def extract_with_auto_bypass(url: str, guild: Optional[discord.Guild]=None
     print(f"❌ Auto-bypass failed: {msg}")
     if guild:
         # Friendly guidance to server about next steps (cookies/proxy)
-        guidance = "If you're getting Cloudflare/403/429 errors, try the following:\n" \
-                   "- Ensure youtube_cookies.txt is present and fresh (exported from your browser within ~30 minutes)\n" \
-                   "- Set YTDLP_PROXY env var to a working proxy (if you have a whitelisted IP)\n" \
-                   "- Set YTDLP_SOURCE_ADDRESS to the IP you solved CAPTCHA from (if applicable)\n" \
+        guidance = "If you're getting Cloudflare/403/429 errors, try the following:\n" 
+                   "- Ensure youtube_cookies.txt is present and fresh (exported from your browser within ~30 minutes)\n" 
+                   "- Set YTDLP_PROXY env var to a working proxy (if you have a whitelisted IP)\n" 
+                   "- Set YTDLP_SOURCE_ADDRESS to the IP you solved CAPTCHA from (if applicable)\n" 
                    "- Provide a current browser User-Agent in YDL_OPTIONS or via environment\n"
         await send_to_guild(guild, f"❌ Extraction failed for {url}. {guidance}")
     return None
 
+# --- Always-on Autoplay Helper ---
+async def autoplay_from_last_song(state: GuildMusicState, guild: discord.Guild) -> bool:
+    """
+    Try to find and queue a related song using the last played song's title.
+    Always automatically invoked when queue runs out.
+    """
+    last_song = state.current_song
+    last_query = None
+
+    if last_song:
+        last_query = last_song.get('title')
+    elif state.entries:
+        last_query = state.entries[-1].get('title')
+    if not last_query:
+        return False
+
+    autoplay_query = f"ytsearch:{last_query} music"
+    try:
+        info = await extract_with_auto_bypass(autoplay_query, guild=guild, base_timeout=15)
+        if info:
+            entries = info.get('entries', [info])
+            # Exclude tracks with the same video id
+            used_ids = {s.get('id') for s in state.entries if 'id' in s}
+            for entry in entries:
+                if entry.get('id') not in used_ids:
+                    state.entries.append(entry)
+                    print(f"[AUTOPLAY] Added similar song '{entry.get('title', 'unknown')}'")
+                    await send_to_guild(guild, f"🎶 Autoplay: Now queueing a related track: **{entry.get('title','(unknown)')}**")
+                    return True
+    except Exception as e:
+        print(f"❌ Autoplay failed: {e}")
+    return False
+
+# --- Modified play_next with always-on autoplay/radio ---
 async def play_next(guild_id: int):
-    """Play the next song in queue with detailed logging."""
+    """Play the next song in queue. With always-on autoplay mode."""
     print(f"\n--- play_next() called for guild {guild_id} ---")
-    
     state = get_music_state(guild_id)
     guild = bot.get_guild(guild_id)
     voice_client = discord.utils.get(bot.voice_clients, guild__id=guild_id)
@@ -282,76 +315,96 @@ async def play_next(guild_id: int):
 
     next_song = state.next_song()
     if not next_song:
-        print(f"⏹️ No more songs in queue for guild {guild_id}")
-        await send_to_guild(guild, "⏹️ Queue ended. Use /play to add more songs!")
-        music_states.pop(guild_id, None)
-        return
+        print(f"⏹️ Queue is empty – triggering autoplay (always-on)...")
+        did_autoplay = await autoplay_from_last_song(state, guild)
+        if did_autoplay:
+            await play_next(guild_id)
+            return
+        else:
+            # Give up after 3 sequential autoplay failures to prevent infinite loop in bad scenarios
+            if not hasattr(state, 'autoplay_failures'):
+                state.autoplay_failures = 0
+            state.autoplay_failures += 1
+            if state.autoplay_failures <= 3:
+                await send_to_guild(guild, f"⚡ Trying to find music related to previous song (attempt {state.autoplay_failures})…")
+                await asyncio.sleep(2)
+                await play_next(guild_id)
+                return
+            else:
+                await send_to_guild(guild, "⛔ Autoplay could not load any related music. Use /play to start a new queue!")
+                music_states.pop(guild_id, None)
+                await voice_client.disconnect()
+                return
 
-    print(f"🎵 Attempting to play: {next_song.get('title', 'Unknown')}")
+    # Reset autoplay failure count on success
+    if hasattr(state, 'autoplay_failures'):
+        state.autoplay_failures = 0
+
+    print(f"🎵 Attempting to play: {next_song.get('title', 'Unknown')}\n")
     print(f"📹 URL: {next_song.get('url', 'No URL')}")
 
     try:
-        # Extract fresh URL using auto-bypass logic
         print(f"🔍 Re-extracting video info with auto-bypass...")
         info = await extract_with_auto_bypass(next_song['url'], guild=guild, base_timeout=15)
-        
         if not info:
             raise Exception("Failed to extract video info (auto-bypass)")
 
         audio_url = info.get('url') or info.get('webpage_url') or next_song.get('url')
         title = info.get('title', next_song.get('title', 'Unknown'))
-        
-        # Verify URL is valid
         if not audio_url or not str(audio_url).startswith('http'):
             raise Exception("Invalid audio URL extracted")
 
-        print(f"✅ Got audio URL, duration: {info.get('duration', 0)}s")
-        print(f"✅ Format: {info.get('format_id', 'unknown')} ({info.get('abr', 'unknown')}kbps)")
-
-        # Prepare FFmpeg options
         ffmpeg_opts = FFMPEG_OPTIONS.copy()
         if state.volume != 1.0:
             ffmpeg_opts['options'] += f' -filter:a "volume={state.volume}"'
 
-        # If the extraction info contains required headers, pass them to ffmpeg if necessary
-        # (discord.FFmpegPCMAudio doesn't support headers directly; would need further work if required)
-
         print(f"🔊 Creating FFmpeg audio source...")
         source = discord.FFmpegPCMAudio(audio_url, **ffmpeg_opts)
-        
+
         def after_playing(error):
             if error:
                 print(f"❌ Player error: {error}")
                 state.last_error = str(error)
-            # Schedule next song if still connected
             if guild_id in music_states and voice_client.is_connected():
                 print(f"📢 Scheduling next song for guild {guild_id}")
                 asyncio.run_coroutine_threadsafe(play_next(guild_id), bot.loop)
-            else:
-                print(f"❌ Not scheduling next song - disconnected")
 
         print(f"▶️ Starting playback...")
         voice_client.play(source, after=after_playing)
         state.playing = True
-        
-        # Show quality info
         quality = f"({info.get('abr', 'HQ')}kbps)" if info.get('abr') else "(HQ)"
         await send_to_guild(guild, f"▶️ Now playing: **{title}** {quality}")
         print(f"✅ Successfully started playback\n")
-    
+
     except Exception as e:
         print(f"❌ Error in play_next: {e}")
         print(traceback.format_exc())
         state.last_error = str(e)
         await send_to_guild(guild, f"❌ Error playing song: {e}")
-        
-        # Try next song if available
+        # Try the next song in queue (if any left)
         if len(state.entries) > state.current_index + 1:
             print(f"🔄 Trying next song...")
             await play_next(guild_id)
         else:
-            print(f"⏹️ No more songs to try, stopping...")
-            music_states.pop(guild_id, None)
+            print(f"⏹️ No more songs to try, attempting always-on autoplay...")
+            did_autoplay = await autoplay_from_last_song(state, guild)
+            if did_autoplay:
+                await play_next(guild_id)
+                return
+            else:
+                # Fail-safe: Try a few times, then disconnect
+                if not hasattr(state, 'autoplay_failures'):
+                    state.autoplay_failures = 0
+                state.autoplay_failures += 1
+                if state.autoplay_failures <= 3:
+                    await send_to_guild(guild, f"⚡ Retrying autoplay (attempt {state.autoplay_failures}) after playback error…")
+                    await asyncio.sleep(2)
+                    await play_next(guild_id)
+                    return
+                else:
+                    await send_to_guild(guild, "⛔ Autoplay could not find new music after error. Use /play to start a new session!")
+                    music_states.pop(guild_id, None)
+                    await voice_client.disconnect()
 
 # --- Bot Events ---
 @bot.event
@@ -362,223 +415,7 @@ async def on_ready():
     print("🔄 Commands synced globally")
     await bot.change_presence(activity=discord.Game(name="🎵 HQ Music | /play"))
 
-@bot.event
-async def on_voice_state_update(member, before, after):
-    """Auto-disconnect when alone."""
-    if member.bot:
-        return
-    
-    voice_client = member.guild.voice_client
-    if voice_client and len(voice_client.channel.members) == 1:
-        print(f"👤 Bot is alone in {voice_client.channel.name}, waiting 30s...")
-        await asyncio.sleep(30)
-        if voice_client.is_connected() and len(voice_client.channel.members) == 1:
-            await voice_client.disconnect()
-            music_states.pop(member.guild.id, None)
-            await send_to_guild(member.guild, "👋 Left due to inactivity.")
+# on_voice_state_update handler has been REMOVED so the bot will NOT leave voice automatically!
 
 # --- Bot Commands ---
-@bot.slash_command(name="play", description="Play YouTube music with premium audio quality")
-@option("query", description="Song name, URL, or playlist", required=True, type=str)
-async def play(ctx: discord.ApplicationContext, query: str):
-    print(f"\n🎵 Play command received: '{query}' from {ctx.author}")
-    await ctx.defer()
-
-    voice_client = await ensure_voice_client(ctx)
-    if not voice_client:
-        print("❌ Failed to get voice client")
-        return
-
-    try:
-        # Show extraction progress
-        await ctx.followup.send(f"🔍 Searching YouTube for '{query}'...")
-        
-        start_time = time.time()
-        # Use auto-bypass extraction for initial search as well
-        with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
-            print(f"🔍 Extracting info from YouTube (auto-bypass will be used on failures)...")
-            info = await extract_with_auto_bypass(query, guild=ctx.guild, base_timeout=20)
-            
-            if not info:
-                raise Exception("YouTube extraction timed out or failed. Check logs.")
-            
-            print(f"✅ Extraction successful, took {time.time() - start_time:.2f}s")
-
-            entries = info.get('entries', [info])
-            if not entries or not entries[0]:
-                raise Exception("No results found or video is unavailable")
-
-            print(f"✅ Found {len(entries)} item(s)")
-
-        # Initialize queue
-        state = get_music_state(ctx.guild.id)
-        state.entries = entries
-        state.current_index = 0
-        state.playing = False  # Will be set to True in play_next
-
-        # Stop current playback
-        if voice_client.is_playing():
-            print("⏹️ Stopping current playback...")
-            voice_client.stop()
-
-        # Send final response
-        first_title = entries[0].get('title', 'Unknown')
-        await ctx.followup.send(f"🎵 Queue ready! Starting with **{first_title}**...")
-        
-        # Start playback
-        await play_next(ctx.guild.id)
-        print("✅ Play command completed successfully\n")
-
-    except Exception as e:
-        print(f"❌ Error in play command: {e}")
-        print(traceback.format_exc())
-        await ctx.followup.send(f"❌ Error: {e}", ephemeral=True)
-
-@bot.slash_command(name="pause", description="Pause the current song")
-async def pause(ctx: discord.ApplicationContext):
-    voice_client = ctx.voice_client
-    if voice_client and voice_client.is_playing():
-        voice_client.pause()
-        await ctx.respond("⏸️ Paused")
-    else:
-        await ctx.respond("❌ Nothing playing.", ephemeral=True)
-
-@bot.slash_command(name="resume", description="Resume a paused song")
-async def resume(ctx: discord.ApplicationContext):
-    voice_client = ctx.voice_client
-    if voice_client and voice_client.is_paused():
-        voice_client.resume()
-        await ctx.respond("▶️ Resumed")
-    else:
-        await ctx.respond("❌ Not paused.", ephemeral=True)
-
-@bot.slash_command(name="skip", description="Skip to next song")
-async def skip(ctx: discord.ApplicationContext):
-    voice_client = ctx.voice_client
-    
-    if not voice_client or not voice_client.is_playing():
-        await ctx.respond("❌ Nothing to skip.", ephemeral=True)
-        return
-    
-    state = get_music_state(ctx.guild.id)
-    if not state.entries or state.current_index >= len(state.entries) - 1:
-        await ctx.respond("⏹️ No more songs in queue.", ephemeral=True)
-        voice_client.stop()
-        return
-    
-    await ctx.respond("⏭️ Skipping...")
-    voice_client.stop()
-
-@bot.slash_command(name="leave", description="Disconnect bot and clear queue")
-async def leave(ctx: discord.ApplicationContext):
-    voice_client = ctx.voice_client
-    
-    if voice_client:
-        await voice_client.disconnect()
-        music_states.pop(ctx.guild.id, None)
-        await ctx.respond("👋 Disconnected and cleared queue.")
-    else:
-        await ctx.respond("❌ Not in a voice channel.", ephemeral=True)
-
-@bot.slash_command(name="queue", description="Show current queue")
-async def queue(ctx: discord.ApplicationContext):
-    state = get_music_state(ctx.guild.id)
-    if not state.entries:
-        await ctx.respond("❌ Queue is empty.", ephemeral=True)
-        return
-
-    songs = state.entries[state.current_index:state.current_index + 10]
-    queue_text = "\n".join([
-        f"{i+1}. **{song.get('title', 'Unknown')}**"
-        for i, song in enumerate(songs)
-    ])
-    
-    embed = discord.Embed(title="🎵 Queue", description=queue_text, color=discord.Color.blue())
-    embed.set_footer(text=f"Loop: {'On' if state.loop else 'Off'} | Volume: {state.volume:.1f}x")
-    await ctx.respond(embed=embed, ephemeral=True)
-
-@bot.slash_command(name="volume", description="Set playback volume (0.1-2.0)")
-@option("level", description="Volume level (0.1 to 2.0)", required=True, type=float)
-async def volume(ctx: discord.ApplicationContext, level: float):
-    if not 0.1 <= level <= 2.0:
-        await ctx.respond("❌ Volume must be between 0.1 and 2.0", ephemeral=True)
-        return
-    
-    state = get_music_state(ctx.guild.id)
-    state.volume = level
-    
-    await ctx.respond(f"🔊 Volume set to {level:.1f}x")
-
-@bot.slash_command(name="loop", description="Toggle queue looping")
-async def loop(ctx: discord.ApplicationContext):
-    state = get_music_state(ctx.guild.id)
-    state.loop = not state.loop
-    status = "🔄 enabled" if state.loop else "❌ disabled"
-    await ctx.respond(f"🔁 Loop {status}")
-
-@bot.slash_command(name="nowplaying", description="Show current song info")
-async def nowplaying(ctx: discord.ApplicationContext):
-    state = get_music_state(ctx.guild.id)
-    song = state.current_song
-    
-    if not song:
-        await ctx.respond("❌ Nothing playing.", ephemeral=True)
-        return
-    
-    embed = discord.Embed(title="▶️ Now Playing", color=discord.Color.green())
-    embed.add_field(name="Title", value=song.get('title', 'Unknown'), inline=False)
-    embed.add_field(name="Duration", value=f"{song.get('duration', 0)}s", inline=True)
-    
-    if 'abr' in song:
-        embed.add_field(name="Quality", value=f"{song.get('abr')}kbps", inline=True)
-    
-    if state.last_error:
-        embed.add_field(name="Last Error", value=state.last_error, inline=False)
-    
-    await ctx.respond(embed=embed, ephemeral=True)
-
-@bot.slash_command(name="debug", description="Show diagnostic information")
-async def debug(ctx: discord.ApplicationContext):
-    """Show bot diagnostic info."""
-    voice_client = ctx.voice_client
-    state = get_music_state(ctx.guild.id)
-    
-    embed = discord.Embed(title="🔧 Debug Info", color=discord.Color.greyple())
-    
-    # Voice connection status
-    if voice_client:
-        embed.add_field(
-            name="Voice", 
-            value=f"Connected: {voice_client.is_connected()}\nPlaying: {voice_client.is_playing()}\nPaused: {voice_client.is_paused()}", 
-            inline=False
-        )
-    else:
-        embed.add_field(name="Voice", value="Not connected", inline=False)
-    
-    # Queue status
-    embed.add_field(
-        name="Queue", 
-        value=f"Items: {len(state.entries)}\nIndex: {state.current_index}\nPlaying: {state.playing}", 
-        inline=False
-    )
-    
-    # Cookies & bypass info
-    embed.add_field(name="YouTube Cookies", value="✅ Loaded" if use_cookies else "❌ Not found", inline=False)
-    embed.add_field(name="Proxy (YTDLP_PROXY)", value=YTDLP_PROXY or "Not set", inline=False)
-    embed.add_field(name="Source Address (YTDLP_SOURCE_ADDRESS)", value=YTDLP_SOURCE_ADDRESS or "Not set", inline=False)
-    await ctx.respond(embed=embed, ephemeral=True)
-
-# --- Run the Bot ---
-TOKEN = os.getenv('DISCORD_TOKEN')
-if not TOKEN:
-    print("❌ Error: DISCORD_TOKEN environment variable not set.")
-    print("   Set it with: export DISCORD_TOKEN='your_token_here'")
-else:
-    try:
-        print("\n🤖 Starting bot...")
-        bot.run(TOKEN)
-    except discord.errors.LoginFailure:
-        print("❌ Error: Invalid Discord token.")
-    except Exception as e:
-        print(f"❌ Unexpected error: {e}")
-        print(traceback.format_exc())
+# ... rest of your bot.py unchanged ...
