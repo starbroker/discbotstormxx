@@ -14,6 +14,13 @@ COPY requirements.txt .
 # Install any needed packages specified in requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
+#
+# THIS IS THE CRUCIAL LINE THAT FIXES YOUR ERROR
+# It forces an upgrade to the latest yt-dlp, fixing the circular import bug
+RUN pip install --upgrade yt-dlp
+#
+#
+
 # Copy the bot script
 COPY bot.py .
 
