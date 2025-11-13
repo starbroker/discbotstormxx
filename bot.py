@@ -6,69 +6,60 @@ import os
 import asyncio
 
 # --- Bot Setup ---
-# Set up intents
 intents = discord.Intents.default()
-intents.message_content = True # Still good to have for future features
+intents.message_content = True
 intents.voice_states = True
 
-# Initialize the bot. We use discord.Bot() for slash commands.
-bot = discord.Bot(intents=intents)
+# PASTE YOUR SERVER/GUILD ID HERE FOR INSTANT UPDATES
+# How to get ID: https://support.discord.com/hc/en-us/articles/206346498-Where-can-I-find-my-User-Server-Message-ID
+DEBUG_GUILD_ID = [PASTE_YOUR_SERVER_ID_HERE] 
+
+bot = discord.Bot(intents=intents, debug_guilds=DEBUG_GUILD_ID)
 
 # --- FFMPEG and YTDL Options ---
 yt_dlp.utils.bug_reports_message = lambda: ''
 
 YDL_OPTIONS = {
     'format': 'bestaudio/best',
-    'noplaylist': False, # Allow search results to be treated as a list
+    'noplaylist': False,
     'quiet': True,
-    'default_search': 'ytsearch', # Use ytsearch as default
-    'source_address': '0.0.0.0' # Binds to IPv4
+    'default_search': 'ytsearch',
+    'source_address': '0.0.0.0'
 }
 
 FFMPEG_OPTIONS = {
     'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
-    'options': '-vn', # No video, just audio
+    'options': '-vn',
 }
 
 # --- Music State Management ---
-# This dictionary will hold the state for each server (guild)
 music_queues = {} # guild_id -> { 'entries': [], 'index': 0, 'playing': True }
 
 # --- Helper Function to Play (Autoplay) ---
 async def play_next(ctx: discord.ApplicationContext):
-    """
-    A helper function that is called after a song finishes.
-    It checks if there's a next song in the search results and plays it.
-    """
     guild_id = ctx.guild.id
     if guild_id not in music_queues:
-        return # No queue for this guild
+        return
 
     state = music_queues[guild_id]
     voice_client = ctx.voice_client
 
-    # Check if the bot is still connected
     if not voice_client or not voice_client.is_connected():
         if guild_id in music_queues:
-            del music_queues[guild_id] # Clear state
+            del music_queues[guild_id]
         return
 
-    # Check if we were told to stop (e.g., by /leave)
     if not state.get('playing', True):
         return
 
-    # Move to the next song index
     state['index'] += 1
     
-    # Check if we are at the end of the search results
     if state['index'] >= len(state['entries']):
-        # Use followup.send for messages after the initial response
         await ctx.followup.send("Reached the end of search results. Stopping autoplay.")
         if guild_id in music_queues:
-            del music_queues[guild_id] # Clear state
+            del music_queues[guild_id]
         return
 
-    # We have a next song, let's play it
     try:
         entry = state['entries'][state['index']]
         audio_url = entry['url']
@@ -76,8 +67,6 @@ async def play_next(ctx: discord.ApplicationContext):
         
         source = discord.FFmpegPCMAudio(audio_url, **FFMPEG_OPTIONS)
         
-        # The core of the autoplay loop:
-        # Play the song, and set 'play_next' to be called again when it's done
         voice_client.play(source, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop))
         
         await ctx.followup.send(f"▶️ Autoplaying: **{song_title}**")
@@ -86,38 +75,31 @@ async def play_next(ctx: discord.ApplicationContext):
         await ctx.followup.send(f"An error occurred during autoplay: {e}")
         print(f"Error in play_next: {e}")
         if guild_id in music_queues:
-            del music_queues[guild_id] # Clear state on error
-
+            del music_queues[guild_id]
 
 # --- Bot Events ---
 @bot.event
 async def on_ready():
     print(f'Logged in as {bot.user.name}')
-    # Sync the commands to make them appear in Discord
-    await bot.sync_commands() 
-    print("Slash commands synced!")
+    # Note: bot.sync_commands() is not needed when using debug_guilds
+    print("Bot is ready and commands are synced to the debug guild.")
     await bot.change_presence(activity=discord.Game(name="Music! /play"))
 
 # --- Bot Commands ---
 @bot.slash_command(name="play", description="Plays songs from YouTube and autoplays search results.")
 @option("query", description="Your song search term or a URL", required=True, type=str)
 async def play(ctx: discord.ApplicationContext, query: str):
-    """
-    Command: /play query:"<search query or URL>"
-    Joins, plays the first song, and sets up autoplay for subsequent results.
-    """
     
     # 1. First, check if the user is in a voice channel. This is a fast check.
     if not ctx.author.voice:
         await ctx.respond("You are not in a voice channel!", ephemeral=True)
         return
     
-    # 2. **THE FIX:** Defer the response *immediately*.
-    # This tells Discord "I'm working on it" and gives you 15 minutes.
-    # This MUST be done before slow operations like connecting to a VC.
+    # 2. **THIS IS THE FIX FOR "UNKNOWN INTERACTION"**
+    # Defer the response *immediately* before any slow operations.
     await ctx.defer()
 
-    # 3. Now, it's safe to connect to the voice channel.
+    # 3. Now, it's safe to do slow things like connect to the voice channel.
     voice_channel = ctx.author.voice.channel
     voice_client = ctx.voice_client
     
@@ -126,45 +108,36 @@ async def play(ctx: discord.ApplicationContext, query: str):
     elif voice_client.channel != voice_channel:
         await voice_client.move_to(voice_channel)
     
-    voice_client = ctx.voice_client # Re-assign after connect/move
+    voice_client = ctx.voice_client
 
-    # 4. Stop any song that is currently playing
     if voice_client.is_playing():
         voice_client.stop()
 
     try:
-        # Search for the query
         with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
             info = ydl.extract_info(query, download=False)
             
             if 'entries' not in info or not info['entries']:
-                # Check if it was a single video URL
                 if 'url' in info:
-                    info['entries'] = [info] # Wrap the single video in a list
+                    info['entries'] = [info]
                 else:
                     await ctx.followup.send(f"Could not find any songs for '{query}'", ephemeral=True)
                     return
 
-        # We have results. Store them for autoplay.
-        # This REPLACES the old list, fulfilling the "!play interrupts" logic
         music_queues[ctx.guild.id] = {
             'entries': info['entries'],
             'index': 0,
             'playing': True
         }
         
-        # Play the FIRST song (index 0)
         first_entry = info['entries'][0]
         audio_url = first_entry['url']
         song_title = first_entry['title']
 
         source = discord.FFmpegPCMAudio(audio_url, **FFMPEG_OPTIONS)
         
-        # Start the play loop
-        # Play the song, and set 'play_next' to be called when it's done
         voice_client.play(source, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop))
         
-        # 5. Use followup.send for the first message after deferring
         await ctx.followup.send(f"▶️ Now playing: **{song_title}**")
 
     except Exception as e:
@@ -198,22 +171,16 @@ async def skip(ctx: discord.ApplicationContext):
         await ctx.respond("I'm not playing anything to skip.", ephemeral=True)
         return
 
-    # Send the "Skipping" message first
     await ctx.respond("⏭️ Skipping...")
-    
-    # Stop the current song.
-    # The 'after' function (play_next) will *automatically* be called,
-    # which then plays the next song and sends the "Autoplaying..." message.
-    voice_client.stop()
+    voice_client.stop() # The 'after' function will handle playing the next song
 
 @bot.slash_command(name="leave", description="Disconnects the bot and clears autoplay")
 async def leave(ctx: discord.ApplicationContext):
     guild_id = ctx.guild.id
     voice_client = ctx.voice_client
 
-    # Clear the autoplay state for this guild
     if guild_id in music_queues:
-        music_queues[guild_id]['playing'] = False # Stop the 'after' loop
+        music_queues[guild_id]['playing'] = False
         del music_queues[guild_id]
 
     if voice_client and voice_client.is_connected():
