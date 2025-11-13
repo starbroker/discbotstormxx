@@ -31,18 +31,35 @@ bot = discord.Bot(intents=intents)
 COOKIE_PATH = 'youtube_cookies.txt'
 use_cookies = os.path.exists(COOKIE_PATH)
 
+# Optional proxy (for bypass) via env var, e.g. "http://127.0.0.1:8080"
+YTDLP_PROXY = os.getenv('YTDLP_PROXY', None)
+# Optional source address to match browser IP when solving captchas
+YTDLP_SOURCE_ADDRESS = os.getenv('YTDLP_SOURCE_ADDRESS', None)
+
+# A small set of user-agents to try when bypassing anti-bot protections
+USER_AGENTS = [
+    # Common desktop Chrome UA
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)"
+    " Chrome/118.0.5993.90 Safari/537.36",
+    # Common Firefox UA
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:119.0) Gecko/20100101 Firefox/119.0",
+    # Android UA (already used in extractor args)
+    "Mozilla/5.0 (Linux; Android 13; SM-G991U) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.5993.90 Mobile Safari/537.36",
+]
+
+# Base yt-dlp options (kept lightweight)
 YDL_OPTIONS = {
-    # Faster format selection
+    # Faster format selection; allow opus where possible
     'format': 'bestaudio[acodec=opus]/bestaudio[ext=m4a]/bestaudio',
     'quiet': True,
     'no_warnings': True,
     'default_search': 'ytsearch',
-    'source_address': '0.0.0.0',
+    'source_address': YTDLP_SOURCE_ADDRESS if YTDLP_SOURCE_ADDRESS else '0.0.0.0',
     'cookiefile': COOKIE_PATH if use_cookies else None,
-    # Speed up extraction
+    # Speed up extraction where possible
     'extract_flat': 'in_playlist',
     'http_headers': {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'User-Agent': USER_AGENTS[-1],  # default to android-like UA for performance
     },
     'extractor_args': {
         'youtube': {
@@ -50,9 +67,15 @@ YDL_OPTIONS = {
             'max_comments': ['0'],
         }
     },
-    # Timeout settings
+    # Timeout/retry settings
     'socket_timeout': 10,
     'retries': 2,
+    # Small HTTP chunk size to reduce risk of YouTube throttling (>10MB chunks)
+    'http_chunk_size': 1048576,  # 1MB
+    # sometimes useful to avoid certificate issues in weird environments
+    'nocheckcertificate': True,
+    # don't use cache to keep behavior predictable
+    'cachedir': False,
 }
 
 FFMPEG_OPTIONS = {
@@ -150,6 +173,96 @@ async def extract_with_timeout(ydl, url, timeout=15):
         print(traceback.format_exc())
         return None
 
+async def extract_with_auto_bypass(url: str, guild: Optional[discord.Guild]=None, base_timeout=20):
+    """
+    Try extracting the URL using several strategies to bypass common anti-bot issues.
+    This tries:
+      1) Base options
+      2) If failure suggests Cloudflare/403/429 or timeout, retry with a list of browser UAs
+      3) If a proxy is configured (YTDLP_PROXY), try with proxy
+      4) If cookies file exists, ensure it's used
+    Returns the info dict on success or None on total failure.
+    """
+    print(f"🔐 Starting auto-bypass extraction for: {url}")
+    attempted = []
+    # Helper to create a YoutubeDL instance with merged options
+    def make_ydl(options_overrides: dict):
+        merged = YDL_OPTIONS.copy()
+        # deep-merge http_headers if provided
+        headers = merged.get('http_headers', {}).copy()
+        overrides_headers = options_overrides.get('http_headers', {})
+        headers.update(overrides_headers)
+        merged['http_headers'] = headers
+        # other overrides
+        for k, v in options_overrides.items():
+            if k == 'http_headers':
+                continue
+            merged[k] = v
+        return yt_dlp.YoutubeDL(merged)
+
+    # First, try a normal extraction
+    try:
+        with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
+            info = await extract_with_timeout(ydl, url, timeout=base_timeout)
+            if info:
+                return info
+    except Exception as e:
+        print(f"❌ Base extraction threw: {e}")
+
+    # Build a list of strategies
+    strategies = []
+
+    # 1) Try different user-agents (and use cookies if available)
+    for ua in USER_AGENTS:
+        strat = {'http_headers': {'User-Agent': ua}}
+        if use_cookies:
+            strat['cookiefile'] = COOKIE_PATH
+        if YTDLP_PROXY:
+            strat['proxy'] = YTDLP_PROXY
+        strategies.append(('UA '+ua.split(' ')[0], strat))
+
+    # 2) If proxy defined, try just proxy (no UA change)
+    if YTDLP_PROXY:
+        strategies.append(('Proxy', {'proxy': YTDLP_PROXY}))
+
+    # 3) Last-ditch larger timeout with cookies + proxy + desktop UA
+    desktop_ua = USER_AGENTS[0]
+    fallback = {'http_headers': {'User-Agent': desktop_ua}, 'socket_timeout': 20, 'retries': 4}
+    if use_cookies:
+        fallback['cookiefile'] = COOKIE_PATH
+    if YTDLP_PROXY:
+        fallback['proxy'] = YTDLP_PROXY
+    strategies.append(('Fallback', fallback))
+
+    # Try each strategy
+    for name, opts in strategies:
+        attempted.append(name)
+        print(f"🛠️ Bypass attempt '{name}' with options: { {k: v for k, v in opts.items() if k != 'http_headers'} }")
+        try:
+            ydl = make_ydl(opts)
+            info = await extract_with_timeout(ydl, url, timeout=base_timeout + 5)
+            if info:
+                print(f"✅ Bypass strategy '{name}' succeeded")
+                return info
+            else:
+                print(f"❌ Bypass strategy '{name}' returned no info")
+        except Exception as e:
+            print(f"❌ Bypass strategy '{name}' error: {e}")
+            print(traceback.format_exc())
+
+    # If we're here, all strategies failed
+    msg = f"Failed extraction after attempts: {attempted}"
+    print(f"❌ Auto-bypass failed: {msg}")
+    if guild:
+        # Friendly guidance to server about next steps (cookies/proxy)
+        guidance = "If you're getting Cloudflare/403/429 errors, try the following:\n" \
+                   "- Ensure youtube_cookies.txt is present and fresh (exported from your browser within ~30 minutes)\n" \
+                   "- Set YTDLP_PROXY env var to a working proxy (if you have a whitelisted IP)\n" \
+                   "- Set YTDLP_SOURCE_ADDRESS to the IP you solved CAPTCHA from (if applicable)\n" \
+                   "- Provide a current browser User-Agent in YDL_OPTIONS or via environment\n"
+        await send_to_guild(guild, f"❌ Extraction failed for {url}. {guidance}")
+    return None
+
 async def play_next(guild_id: int):
     """Play the next song in queue with detailed logging."""
     print(f"\n--- play_next() called for guild {guild_id} ---")
@@ -178,28 +291,30 @@ async def play_next(guild_id: int):
     print(f"📹 URL: {next_song.get('url', 'No URL')}")
 
     try:
-        # Extract fresh URL
-        with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
-            print(f"🔍 Re-extracting video info...")
-            info = await extract_with_timeout(ydl, next_song['url'], timeout=15)
-            
-            if not info:
-                raise Exception("Failed to extract video info (timeout)")
+        # Extract fresh URL using auto-bypass logic
+        print(f"🔍 Re-extracting video info with auto-bypass...")
+        info = await extract_with_auto_bypass(next_song['url'], guild=guild, base_timeout=15)
+        
+        if not info:
+            raise Exception("Failed to extract video info (auto-bypass)")
 
-            audio_url = info['url']
-            title = info.get('title', 'Unknown')
-            
-            # Verify URL is valid
-            if not audio_url or not audio_url.startswith('http'):
-                raise Exception("Invalid audio URL extracted")
+        audio_url = info.get('url') or info.get('webpage_url') or next_song.get('url')
+        title = info.get('title', next_song.get('title', 'Unknown'))
+        
+        # Verify URL is valid
+        if not audio_url or not str(audio_url).startswith('http'):
+            raise Exception("Invalid audio URL extracted")
 
-            print(f"✅ Got audio URL, duration: {info.get('duration', 0)}s")
-            print(f"✅ Format: {info.get('format_id', 'unknown')} ({info.get('abr', 'unknown')}kbps)")
+        print(f"✅ Got audio URL, duration: {info.get('duration', 0)}s")
+        print(f"✅ Format: {info.get('format_id', 'unknown')} ({info.get('abr', 'unknown')}kbps)")
 
         # Prepare FFmpeg options
         ffmpeg_opts = FFMPEG_OPTIONS.copy()
         if state.volume != 1.0:
             ffmpeg_opts['options'] += f' -filter:a "volume={state.volume}"'
+
+        # If the extraction info contains required headers, pass them to ffmpeg if necessary
+        # (discord.FFmpegPCMAudio doesn't support headers directly; would need further work if required)
 
         print(f"🔊 Creating FFmpeg audio source...")
         source = discord.FFmpegPCMAudio(audio_url, **ffmpeg_opts)
@@ -279,9 +394,10 @@ async def play(ctx: discord.ApplicationContext, query: str):
         await ctx.followup.send(f"🔍 Searching YouTube for '{query}'...")
         
         start_time = time.time()
+        # Use auto-bypass extraction for initial search as well
         with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
-            print(f"🔍 Extracting info from YouTube...")
-            info = await extract_with_timeout(ydl, query, timeout=20)
+            print(f"🔍 Extracting info from YouTube (auto-bypass will be used on failures)...")
+            info = await extract_with_auto_bypass(query, guild=ctx.guild, base_timeout=20)
             
             if not info:
                 raise Exception("YouTube extraction timed out or failed. Check logs.")
@@ -446,9 +562,10 @@ async def debug(ctx: discord.ApplicationContext):
         inline=False
     )
     
-    # Cookies
+    # Cookies & bypass info
     embed.add_field(name="YouTube Cookies", value="✅ Loaded" if use_cookies else "❌ Not found", inline=False)
-    
+    embed.add_field(name="Proxy (YTDLP_PROXY)", value=YTDLP_PROXY or "Not set", inline=False)
+    embed.add_field(name="Source Address (YTDLP_SOURCE_ADDRESS)", value=YTDLP_SOURCE_ADDRESS or "Not set", inline=False)
     await ctx.respond(embed=embed, ephemeral=True)
 
 # --- Run the Bot ---
