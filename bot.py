@@ -1,5 +1,6 @@
 import discord
-from discord import option # Import the 'option' decorator
+from discord import option
+from discord.ext import commands
 import yt_dlp
 import os
 import asyncio
@@ -18,15 +19,15 @@ yt_dlp.utils.bug_reports_message = lambda: ''
 
 YDL_OPTIONS = {
     'format': 'bestaudio/best',
-    'noplaylist': False,
+    'noplaylist': False, # Allow search results to be treated as a list
     'quiet': True,
-    'default_search': 'ytsearch',
-    'source_address': '0.0.0.0'
+    'default_search': 'ytsearch', # Use ytsearch as default
+    'source_address': '0.0.0.0' # Binds to IPv4
 }
 
 FFMPEG_OPTIONS = {
     'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
-    'options': '-vn',
+    'options': '-vn', # No video, just audio
 }
 
 # --- Music State Management ---
@@ -48,7 +49,8 @@ async def play_next(ctx: discord.ApplicationContext):
 
     # Check if the bot is still connected
     if not voice_client or not voice_client.is_connected():
-        del music_queues[guild_id] # Clear state
+        if guild_id in music_queues:
+            del music_queues[guild_id] # Clear state
         return
 
     # Check if we were told to stop (e.g., by /leave)
@@ -62,7 +64,8 @@ async def play_next(ctx: discord.ApplicationContext):
     if state['index'] >= len(state['entries']):
         # Use followup.send for messages after the initial response
         await ctx.followup.send("Reached the end of search results. Stopping autoplay.")
-        del music_queues[guild_id] # Clear state
+        if guild_id in music_queues:
+            del music_queues[guild_id] # Clear state
         return
 
     # We have a next song, let's play it
@@ -103,16 +106,21 @@ async def play(ctx: discord.ApplicationContext, query: str):
     Command: /play query:"<search query or URL>"
     Joins, plays the first song, and sets up autoplay for subsequent results.
     """
-    # Check if the user is in a voice channel
+    
+    # 1. First, check if the user is in a voice channel. This is a fast check.
     if not ctx.author.voice:
-        # 'ephemeral=True' makes the message only visible to the user
         await ctx.respond("You are not in a voice channel!", ephemeral=True)
         return
     
+    # 2. **THE FIX:** Defer the response *immediately*.
+    # This tells Discord "I'm working on it" and gives you 15 minutes.
+    # This MUST be done before slow operations like connecting to a VC.
+    await ctx.defer()
+
+    # 3. Now, it's safe to connect to the voice channel.
     voice_channel = ctx.author.voice.channel
     voice_client = ctx.voice_client
-
-    # Connect or move to the user's channel
+    
     if not voice_client:
         await voice_channel.connect()
     elif voice_client.channel != voice_channel:
@@ -120,12 +128,7 @@ async def play(ctx: discord.ApplicationContext, query: str):
     
     voice_client = ctx.voice_client # Re-assign after connect/move
 
-    # **CRITICAL** Defer the response.
-    # This shows "Bot is thinking..." and gives us more than 3 seconds
-    # to search YouTube and start the song.
-    await ctx.defer()
-
-    # Stop any song that is currently playing
+    # 4. Stop any song that is currently playing
     if voice_client.is_playing():
         voice_client.stop()
 
@@ -143,6 +146,7 @@ async def play(ctx: discord.ApplicationContext, query: str):
                     return
 
         # We have results. Store them for autoplay.
+        # This REPLACES the old list, fulfilling the "!play interrupts" logic
         music_queues[ctx.guild.id] = {
             'entries': info['entries'],
             'index': 0,
@@ -157,9 +161,10 @@ async def play(ctx: discord.ApplicationContext, query: str):
         source = discord.FFmpegPCMAudio(audio_url, **FFMPEG_OPTIONS)
         
         # Start the play loop
+        # Play the song, and set 'play_next' to be called when it's done
         voice_client.play(source, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop))
         
-        # Use followup.send for the first message after deferring
+        # 5. Use followup.send for the first message after deferring
         await ctx.followup.send(f"▶️ Now playing: **{song_title}**")
 
     except Exception as e:
