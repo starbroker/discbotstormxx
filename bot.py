@@ -10,11 +10,8 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.voice_states = True
 
-# PASTE YOUR SERVER/GUILD ID HERE FOR INSTANT UPDATES
-# How to get ID: https://support.discord.com/hc/en-us/articles/206346498-Where-can-I-find-my-User-Server-Message-ID
-DEBUG_GUILD_ID = [PASTE_YOUR_SERVER_ID_HERE] 
-
-bot = discord.Bot(intents=intents, debug_guilds=DEBUG_GUILD_ID)
+# We removed debug_guilds, so the bot uses global commands.
+bot = discord.Bot(intents=intents)
 
 # --- FFMPEG and YTDL Options ---
 yt_dlp.utils.bug_reports_message = lambda: ''
@@ -81,8 +78,12 @@ async def play_next(ctx: discord.ApplicationContext):
 @bot.event
 async def on_ready():
     print(f'Logged in as {bot.user.name}')
-    # Note: bot.sync_commands() is not needed when using debug_guilds
-    print("Bot is ready and commands are synced to the debug guild.")
+    
+    # **This is needed for global commands**
+    # It can take up to an hour for commands to appear in all servers.
+    await bot.sync_commands() 
+    
+    print("Bot is ready and commands are synced globally.")
     await bot.change_presence(activity=discord.Game(name="Music! /play"))
 
 # --- Bot Commands ---
@@ -90,16 +91,13 @@ async def on_ready():
 @option("query", description="Your song search term or a URL", required=True, type=str)
 async def play(ctx: discord.ApplicationContext, query: str):
     
-    # 1. First, check if the user is in a voice channel. This is a fast check.
     if not ctx.author.voice:
         await ctx.respond("You are not in a voice channel!", ephemeral=True)
         return
     
-    # 2. **THIS IS THE FIX FOR "UNKNOWN INTERACTION"**
-    # Defer the response *immediately* before any slow operations.
+    # Defer the response *immediately*
     await ctx.defer()
 
-    # 3. Now, it's safe to do slow things like connect to the voice channel.
     voice_channel = ctx.author.voice.channel
     voice_client = ctx.voice_client
     
